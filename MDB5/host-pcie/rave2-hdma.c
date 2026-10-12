@@ -14,9 +14,12 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/delay.h>
 #include <linux/dma/edma.h>
 #include <linux/dma-mapping.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/pci.h>
 
 #define RAVE2_HDMA_VSEC_ID		0x6
@@ -27,6 +30,29 @@
 #define RAVE2_HDMA_WR_CH_MASK		GENMASK(9, 0)
 #define RAVE2_HDMA_RD_CH_MASK		GENMASK(25, 16)
 #define RAVE2_HDMA_LL_SIZE		PAGE_SIZE
+#define RAVE2_HDMA_CH_EN		0x00
+#define RAVE2_HDMA_DOORBELL		0x04
+#define RAVE2_HDMA_LLP_LO		0x10
+#define RAVE2_HDMA_LLP_HI		0x14
+#define RAVE2_HDMA_CYCLE		0x18
+#define RAVE2_HDMA_SIZE			0x1c
+#define RAVE2_HDMA_SAR_LO		0x20
+#define RAVE2_HDMA_SAR_HI		0x24
+#define RAVE2_HDMA_DAR_LO		0x28
+#define RAVE2_HDMA_DAR_HI		0x2c
+#define RAVE2_HDMA_CONTROL1		0x34
+#define RAVE2_HDMA_CH_STAT		0x80
+#define RAVE2_HDMA_INT_STAT		0x84
+#define RAVE2_HDMA_INT_SETUP		0x88
+#define RAVE2_HDMA_INT_CLEAR		0x8c
+#define RAVE2_HDMA_INT_MASK		(BIT(0) | BIT(2))
+#define RAVE2_HDMA_RD_CH		0x100
+
+static u64 rave2_ep_addr = 0x97fff0000ULL;
+module_param_named(ep_addr, rave2_ep_addr, ullong, 0644);
+MODULE_PARM_DESC(ep_addr, "Versal AXI address read by the HDMA self-test");
+
+static DEFINE_MUTEX(rave2_selftest_lock);
 
 static const struct pci_device_id rave2_hdma_ids[] = {
 	{ PCI_DEVICE_SUB(PCI_VENDOR_ID_XILINX, 0x9038,
@@ -35,6 +61,209 @@ static const struct pci_device_id rave2_hdma_ids[] = {
 };
 MODULE_DEVICE_TABLE(pci, rave2_hdma_ids);
 
+static ssize_t rave2_ll_show(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	struct dw_edma_chip *chip = pci_get_drvdata(to_pci_dev(dev));
+	struct dw_edma_region *regions[2] = {
+		&chip->ll_region_wr[0],
+		&chip->ll_region_rd[0],
+	};
+	static const char * const names[] = { "write0", "read0" };
+	ssize_t len = 0;
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		u32 *word = regions[i]->vaddr.mem;
+		u64 sar, dar, llp;
+
+		if (!word)
+			continue;
+
+		sar = ((u64)word[3] << 32) | word[2];
+		dar = ((u64)word[5] << 32) | word[4];
+		llp = ((u64)word[9] << 32) | word[8];
+		len += sysfs_emit_at(buf, len, "%s paddr=%#llx\n",
+				     names[i], regions[i]->paddr);
+		len += sysfs_emit_at(buf, len,
+				     "elem0 control=%#x size=%#x sar=%#llx dar=%#llx\n",
+				     word[0], word[1], sar, dar);
+		len += sysfs_emit_at(buf, len,
+				     "elem1 control=%#x reserved=%#x llp=%#llx\n",
+				     word[6], word[7], llp);
+	}
+
+	return len;
+}
+static DEVICE_ATTR_RO(rave2_ll);
+
+static ssize_t selftest_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct dw_edma_chip *chip = pci_get_drvdata(pdev);
+	void __iomem *regs = chip->reg_base;
+	u32 *data, stat = 0, intr, saved, size;
+	dma_addr_t dma;
+	ssize_t len;
+	int ret;
+
+	if (!mutex_trylock(&rave2_selftest_lock))
+		return -EBUSY;
+
+	data = dma_alloc_coherent(&pdev->dev, 4, &dma, GFP_KERNEL);
+	if (!data) {
+		mutex_unlock(&rave2_selftest_lock);
+		return -ENOMEM;
+	}
+	*data = 0x11111111;
+
+	saved = readl(regs + RAVE2_HDMA_INT_SETUP);
+	writel(saved | RAVE2_HDMA_INT_MASK, regs + RAVE2_HDMA_INT_SETUP);
+	writel(RAVE2_HDMA_INT_MASK, regs + RAVE2_HDMA_INT_CLEAR);
+	writel(0, regs + RAVE2_HDMA_CH_EN);
+	writel(0, regs + RAVE2_HDMA_CONTROL1);
+	writel(lower_32_bits(rave2_ep_addr), regs + RAVE2_HDMA_SAR_LO);
+	writel(upper_32_bits(rave2_ep_addr), regs + RAVE2_HDMA_SAR_HI);
+	writel(lower_32_bits(dma), regs + RAVE2_HDMA_DAR_LO);
+	writel(upper_32_bits(dma), regs + RAVE2_HDMA_DAR_HI);
+	writel(4, regs + RAVE2_HDMA_SIZE);
+	writel(1, regs + RAVE2_HDMA_CH_EN);
+	writel(1, regs + RAVE2_HDMA_DOORBELL);
+
+	ret = readl_poll_timeout(regs + RAVE2_HDMA_CH_STAT, stat,
+				 (stat & 3) != 1, 10, 100000);
+	intr = readl(regs + RAVE2_HDMA_INT_STAT);
+	size = readl(regs + RAVE2_HDMA_SIZE);
+	writel(RAVE2_HDMA_INT_MASK, regs + RAVE2_HDMA_INT_CLEAR);
+	writel(0, regs + RAVE2_HDMA_CH_EN);
+	writel(saved, regs + RAVE2_HDMA_INT_SETUP);
+
+	len = sysfs_emit(buf,
+			 "simple ep=%#llx dar=%#llx word=%#x stat=%#x int=%#x size=%#x poll=%d\n",
+			 rave2_ep_addr, (u64)dma, *data, stat, intr, size, ret);
+	dma_free_coherent(&pdev->dev, 4, data, dma);
+
+	data = dma_alloc_coherent(&pdev->dev, 4, &dma, GFP_KERNEL);
+	if (data) {
+		u32 *list;
+		dma_addr_t list_dma;
+
+		*data = 0x11111111;
+		list = dma_alloc_coherent(&pdev->dev, 64, &list_dma, GFP_KERNEL);
+		if (!list) {
+			dma_free_coherent(&pdev->dev, 4, data, dma);
+		} else {
+			list[0] = 1;
+			list[1] = 4;
+			list[2] = lower_32_bits(rave2_ep_addr);
+			list[3] = upper_32_bits(rave2_ep_addr);
+			list[4] = lower_32_bits(dma);
+			list[5] = upper_32_bits(dma);
+			list[6] = 6;
+			list[7] = 0;
+			list[8] = lower_32_bits(list_dma);
+			list[9] = upper_32_bits(list_dma);
+			dma_wmb();
+
+			writel(saved | RAVE2_HDMA_INT_MASK, regs + RAVE2_HDMA_INT_SETUP);
+			writel(RAVE2_HDMA_INT_MASK, regs + RAVE2_HDMA_INT_CLEAR);
+			writel(0, regs + RAVE2_HDMA_CH_EN);
+			writel(1, regs + RAVE2_HDMA_CONTROL1);
+			writel(lower_32_bits(list_dma), regs + RAVE2_HDMA_LLP_LO);
+			writel(upper_32_bits(list_dma), regs + RAVE2_HDMA_LLP_HI);
+			writel(3, regs + RAVE2_HDMA_CYCLE);
+			writel(1, regs + RAVE2_HDMA_CH_EN);
+			writel(1, regs + RAVE2_HDMA_DOORBELL);
+
+			stat = 0;
+			ret = readl_poll_timeout(regs + RAVE2_HDMA_CH_STAT, stat,
+						 (stat & 3) != 1, 10, 100000);
+			intr = readl(regs + RAVE2_HDMA_INT_STAT);
+			writel(RAVE2_HDMA_INT_MASK, regs + RAVE2_HDMA_INT_CLEAR);
+			writel(0, regs + RAVE2_HDMA_CH_EN);
+			writel(0, regs + RAVE2_HDMA_CONTROL1);
+			writel(saved, regs + RAVE2_HDMA_INT_SETUP);
+
+			len += sysfs_emit_at(buf, len,
+					     "list ep=%#llx dar=%#llx llp=%#llx word=%#x stat=%#x int=%#x poll=%d\n",
+					     rave2_ep_addr, (u64)dma, (u64)list_dma,
+					     *data, stat, intr, ret);
+
+			/*
+			 * The endpoint fetches the list through its local AXI
+			 * port. Stage the same descriptor in Versal DDR and
+			 * point the channel at that address.
+			 */
+			list[8] = lower_32_bits(rave2_ep_addr + 0x1000);
+			list[9] = upper_32_bits(rave2_ep_addr + 0x1000);
+			dma_wmb();
+			/*
+			 * Read channel: source is host memory, destination is
+			 * Versal DDR. The write channel cannot make that copy.
+			 */
+			writel(readl(regs + RAVE2_HDMA_RD_CH + RAVE2_HDMA_INT_SETUP) |
+			       RAVE2_HDMA_INT_MASK,
+			       regs + RAVE2_HDMA_RD_CH + RAVE2_HDMA_INT_SETUP);
+			writel(RAVE2_HDMA_INT_MASK, regs + RAVE2_HDMA_RD_CH + RAVE2_HDMA_INT_CLEAR);
+			writel(0, regs + RAVE2_HDMA_RD_CH + RAVE2_HDMA_CH_EN);
+			writel(0, regs + RAVE2_HDMA_RD_CH + RAVE2_HDMA_CONTROL1);
+			writel(lower_32_bits(list_dma), regs + RAVE2_HDMA_RD_CH + RAVE2_HDMA_SAR_LO);
+			writel(upper_32_bits(list_dma), regs + RAVE2_HDMA_RD_CH + RAVE2_HDMA_SAR_HI);
+			writel(list[8], regs + RAVE2_HDMA_RD_CH + RAVE2_HDMA_DAR_LO);
+			writel(list[9], regs + RAVE2_HDMA_RD_CH + RAVE2_HDMA_DAR_HI);
+			writel(64, regs + RAVE2_HDMA_RD_CH + RAVE2_HDMA_SIZE);
+			writel(1, regs + RAVE2_HDMA_RD_CH + RAVE2_HDMA_CH_EN);
+			writel(1, regs + RAVE2_HDMA_RD_CH + RAVE2_HDMA_DOORBELL);
+			stat = 0;
+			ret = readl_poll_timeout(regs + RAVE2_HDMA_RD_CH + RAVE2_HDMA_CH_STAT,
+						 stat, (stat & 3) != 1, 10, 100000);
+			writel(RAVE2_HDMA_INT_MASK, regs + RAVE2_HDMA_RD_CH + RAVE2_HDMA_INT_CLEAR);
+			writel(0, regs + RAVE2_HDMA_RD_CH + RAVE2_HDMA_CH_EN);
+			len += sysfs_emit_at(buf, len, "copy stat=%#x poll=%d\n", stat, ret);
+
+			*data = 0x11111111;
+			writel(lower_32_bits(rave2_ep_addr + 0x1000), regs + RAVE2_HDMA_SAR_LO);
+			writel(upper_32_bits(rave2_ep_addr + 0x1000), regs + RAVE2_HDMA_SAR_HI);
+			writel(lower_32_bits(dma), regs + RAVE2_HDMA_DAR_LO);
+			writel(upper_32_bits(dma), regs + RAVE2_HDMA_DAR_HI);
+			writel(4, regs + RAVE2_HDMA_SIZE);
+			writel(1, regs + RAVE2_HDMA_CH_EN);
+			writel(1, regs + RAVE2_HDMA_DOORBELL);
+			readl_poll_timeout(regs + RAVE2_HDMA_CH_STAT, stat,
+					   (stat & 3) != 1, 10, 100000);
+			writel(RAVE2_HDMA_INT_MASK, regs + RAVE2_HDMA_INT_CLEAR);
+			writel(0, regs + RAVE2_HDMA_CH_EN);
+			len += sysfs_emit_at(buf, len, "staged word=%#x stat=%#x\n",
+					     *data, stat);
+
+			*data = 0x11111111;
+			writel(1, regs + RAVE2_HDMA_CONTROL1);
+			writel(list[8], regs + RAVE2_HDMA_LLP_LO);
+			writel(list[9], regs + RAVE2_HDMA_LLP_HI);
+			writel(3, regs + RAVE2_HDMA_CYCLE);
+			writel(1, regs + RAVE2_HDMA_CH_EN);
+			writel(1, regs + RAVE2_HDMA_DOORBELL);
+			stat = 0;
+			ret = readl_poll_timeout(regs + RAVE2_HDMA_CH_STAT, stat,
+						 (stat & 3) != 1, 10, 100000);
+			intr = readl(regs + RAVE2_HDMA_INT_STAT);
+			writel(RAVE2_HDMA_INT_MASK, regs + RAVE2_HDMA_INT_CLEAR);
+			writel(0, regs + RAVE2_HDMA_CH_EN);
+			writel(0, regs + RAVE2_HDMA_CONTROL1);
+			writel(saved, regs + RAVE2_HDMA_INT_SETUP);
+			len += sysfs_emit_at(buf, len,
+					     "local llp=%#llx word=%#x stat=%#x int=%#x poll=%d\n",
+					     rave2_ep_addr + 0x1000, *data, stat, intr, ret);
+			dma_free_coherent(&pdev->dev, 64, list, list_dma);
+			dma_free_coherent(&pdev->dev, 4, data, dma);
+		}
+	}
+	mutex_unlock(&rave2_selftest_lock);
+	return len;
+}
+static DEVICE_ATTR_RO(selftest);
+
 static int rave2_hdma_irq_vector(struct device *dev, unsigned int nr)
 {
 	return pci_irq_vector(to_pci_dev(dev), nr);
@@ -42,16 +271,13 @@ static int rave2_hdma_irq_vector(struct device *dev, unsigned int nr)
 
 static u64 rave2_hdma_pci_address(struct device *dev, phys_addr_t cpu_addr)
 {
-	struct pci_dev *pdev = to_pci_dev(dev);
-	struct resource res = {
-		.flags = IORESOURCE_MEM,
-		.start = cpu_addr,
-		.end = cpu_addr,
-	};
-	struct pci_bus_region region;
-
-	pcibios_resource_to_bus(pdev->bus, &region, &res);
-	return region.start;
+	/*
+	 * dmaengine passes the Versal AXI address here. It is already the
+	 * address the endpoint HDMA must use. Host buffers arrive separately
+	 * as dma_addr_t values and are not translated again.
+	 */
+	dev_info(dev, "HDMA endpoint address %#llx\n", (u64)cpu_addr);
+	return cpu_addr;
 }
 
 static const struct dw_edma_plat_ops rave2_hdma_ops = {
@@ -218,6 +444,19 @@ static int rave2_hdma_probe(struct pci_dev *pdev, const struct pci_device_id *id
 	}
 
 	pci_set_drvdata(pdev, chip);
+	err = device_create_file(&pdev->dev, &dev_attr_rave2_ll);
+	if (err) {
+		dw_edma_remove(chip);
+		pci_free_irq_vectors(pdev);
+		return err;
+	}
+	err = device_create_file(&pdev->dev, &dev_attr_selftest);
+	if (err) {
+		device_remove_file(&pdev->dev, &dev_attr_rave2_ll);
+		dw_edma_remove(chip);
+		pci_free_irq_vectors(pdev);
+		return err;
+	}
 	pci_info(pdev, "registered %u write and %u read HDMA channels, irqs=%d\n",
 		 wr, rd, nr_irqs);
 	return 0;
@@ -227,6 +466,8 @@ static void rave2_hdma_remove(struct pci_dev *pdev)
 {
 	struct dw_edma_chip *chip = pci_get_drvdata(pdev);
 
+	device_remove_file(&pdev->dev, &dev_attr_selftest);
+	device_remove_file(&pdev->dev, &dev_attr_rave2_ll);
 	if (chip)
 		dw_edma_remove(chip);
 	pci_free_irq_vectors(pdev);
