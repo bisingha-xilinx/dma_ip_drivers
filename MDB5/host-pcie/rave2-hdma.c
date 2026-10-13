@@ -7,10 +7,11 @@
  * offset 0. The stock dw-edma-pcie driver does not bind this vendor
  * and maps linked lists through the Synopsys EDDA BAR2 layout.
  *
- * This module maps only the register BAR, keeps linked lists in host
- * memory, and calls dw_edma_probe(). If the channel-enable register
- * still reads as all ones, it stops before that call so the core does
- * not write the aperture.
+ * Linked lists live in the last 512 KiB of Versal high DDR. PF0 BAR2
+ * translates to that AXI address, and dw-edma programs it as the LLP.
+ * The host writes the descriptors through BAR2. If the channel-enable
+ * register still reads as all ones, probe stops before dw_edma_probe()
+ * so the core does not write the aperture.
  */
 
 #include <linux/bitfield.h>
@@ -30,6 +31,8 @@
 #define RAVE2_HDMA_WR_CH_MASK		GENMASK(9, 0)
 #define RAVE2_HDMA_RD_CH_MASK		GENMASK(25, 16)
 #define RAVE2_HDMA_LL_SIZE		PAGE_SIZE
+/* Last 512 KiB of the PCIe high-DDR window. Matches bd_rave2.tcl. */
+#define RAVE2_HDMA_LL_AXI		0xb7ff80000ULL
 #define RAVE2_HDMA_CH_EN		0x00
 #define RAVE2_HDMA_DOORBELL		0x04
 #define RAVE2_HDMA_LLP_LO		0x10
@@ -74,23 +77,23 @@ static ssize_t rave2_ll_show(struct device *dev,
 	int i;
 
 	for (i = 0; i < 2; i++) {
-		u32 *word = regions[i]->vaddr.mem;
+		void __iomem *word = regions[i]->vaddr.io;
 		u64 sar, dar, llp;
 
 		if (!word)
 			continue;
 
-		sar = ((u64)word[3] << 32) | word[2];
-		dar = ((u64)word[5] << 32) | word[4];
-		llp = ((u64)word[9] << 32) | word[8];
+		sar = ((u64)readl(word + 12) << 32) | readl(word + 8);
+		dar = ((u64)readl(word + 20) << 32) | readl(word + 16);
+		llp = ((u64)readl(word + 36) << 32) | readl(word + 32);
 		len += sysfs_emit_at(buf, len, "%s paddr=%#llx\n",
 				     names[i], regions[i]->paddr);
 		len += sysfs_emit_at(buf, len,
 				     "elem0 control=%#x size=%#x sar=%#llx dar=%#llx\n",
-				     word[0], word[1], sar, dar);
+				     readl(word + 0), readl(word + 4), sar, dar);
 		len += sysfs_emit_at(buf, len,
 				     "elem1 control=%#x reserved=%#x llp=%#llx\n",
-				     word[6], word[7], llp);
+				     readl(word + 24), readl(word + 28), llp);
 	}
 
 	return len;
@@ -307,30 +310,33 @@ static int rave2_hdma_find_vsec(struct pci_dev *pdev, u16 *pos)
 	return -ENODEV;
 }
 
-static int rave2_hdma_alloc_ll(struct pci_dev *pdev, struct dw_edma_chip *chip)
+static int rave2_hdma_map_ll(struct pci_dev *pdev, struct dw_edma_chip *chip,
+			    void __iomem *bar2)
 {
 	struct dw_edma_region *region;
-	dma_addr_t dma;
+	u64 need;
 	int i;
+
+	need = (u64)(chip->ll_wr_cnt + chip->ll_rd_cnt) * RAVE2_HDMA_LL_SIZE;
+	if (need > pci_resource_len(pdev, 2)) {
+		pci_err(pdev, "BAR2 is %#llx bytes, linked lists need %#llx\n",
+			(u64)pci_resource_len(pdev, 2), need);
+		return -ENOSPC;
+	}
 
 	for (i = 0; i < chip->ll_wr_cnt; i++) {
 		region = &chip->ll_region_wr[i];
 		region->sz = RAVE2_HDMA_LL_SIZE;
-		region->vaddr.mem = dmam_alloc_coherent(&pdev->dev, region->sz,
-							&dma, GFP_KERNEL);
-		if (!region->vaddr.mem)
-			return -ENOMEM;
-		region->paddr = dma;
+		region->vaddr.io = bar2 + (i * RAVE2_HDMA_LL_SIZE);
+		region->paddr = RAVE2_HDMA_LL_AXI + (i * RAVE2_HDMA_LL_SIZE);
 	}
 
 	for (i = 0; i < chip->ll_rd_cnt; i++) {
 		region = &chip->ll_region_rd[i];
 		region->sz = RAVE2_HDMA_LL_SIZE;
-		region->vaddr.mem = dmam_alloc_coherent(&pdev->dev, region->sz,
-							&dma, GFP_KERNEL);
-		if (!region->vaddr.mem)
-			return -ENOMEM;
-		region->paddr = dma;
+		region->vaddr.io = bar2 + ((chip->ll_wr_cnt + i) * RAVE2_HDMA_LL_SIZE);
+		region->paddr = RAVE2_HDMA_LL_AXI +
+				((chip->ll_wr_cnt + i) * RAVE2_HDMA_LL_SIZE);
 	}
 
 	return 0;
@@ -389,9 +395,9 @@ static int rave2_hdma_probe(struct pci_dev *pdev, const struct pci_device_id *id
 		return -ENODEV;
 	}
 
-	err = pcim_iomap_regions(pdev, BIT(0), pci_name(pdev));
+	err = pcim_iomap_regions(pdev, BIT(0) | BIT(2), pci_name(pdev));
 	if (err) {
-		pci_err(pdev, "BAR0 mapping failed\n");
+		pci_err(pdev, "BAR0/BAR2 mapping failed\n");
 		return err;
 	}
 	regs = pcim_iomap_table(pdev)[0];
@@ -424,9 +430,13 @@ static int rave2_hdma_probe(struct pci_dev *pdev, const struct pci_device_id *id
 	chip->ll_wr_cnt = wr;
 	chip->ll_rd_cnt = rd;
 
-	err = rave2_hdma_alloc_ll(pdev, chip);
+	if (!pcim_iomap_table(pdev)[2])
+		return -ENOMEM;
+	err = rave2_hdma_map_ll(pdev, chip, pcim_iomap_table(pdev)[2]);
 	if (err)
 		return err;
+	pci_info(pdev, "HDMA linked lists in BAR2, AXI base %#llx\n",
+		 RAVE2_HDMA_LL_AXI);
 
 	nr_irqs = pci_alloc_irq_vectors(pdev, 1, 7, PCI_IRQ_MSIX | PCI_IRQ_MSI);
 	if (nr_irqs < 1) {
